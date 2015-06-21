@@ -1,0 +1,156 @@
+---
+title: 'PML: Human Activity Recognition dataset'
+author: "Ariel Lev, 21. June 2015"
+output: 
+  html_document:
+    keep_md: true
+    css: style.css
+    pandoc_args: [
+      "+RTS", "-K64m",
+      "-RTS"
+    ]    
+---
+```{r, echo=F, fig.width=12, fig.height=4, message=F, warning=F}
+require(ggplot2)
+require(knitr)
+require(caret)
+require(doParallel)
+require(AppliedPredictiveModeling)
+
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+```
+
+This report suggests Random Forest as a method for learning how to classify and predict weight lift performances out of 5 possible classes labeled 'A' to 'E'.  
+The work was made during the "Pratcial machine learning" course offered online by coursera and John Hopkins Bloomberg School of Public Health.
+The dataset **Human Activity Recognition** was compiled by [*Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.*](http://groupware.les.inf.puc-rio.br/har#ixzz3dhZiRBvy)
+
+### Cleaining Data
+
+Loading the data sets into R and performing an initial exploration. We can see that some of the variables are merely used for bookkeeping purpose, and some contain a substantial high rate of missing values - either NAs or empty strings. 
+```{r, echo=T, message=F}
+# Loading the data into R
+har.train <- read.csv("pml-training.csv", header = T, stringsAsFactors = F)
+har.test <- read.csv("pml-testing.csv", header = T, stringsAsFactors = F)
+
+# exploring dimensions and 15 of the variables.
+dim(har.train)
+str(har.train[,1:15])
+
+# removing bookkeeping data such as user name, window nums, etc..
+har.train <- har.train[,-c(1:7)]
+har.test <- har.test[,-c(1:7)]
+
+# complete cases rate yields a substantially low figure of only 2%. 
+mean(complete.cases(har.train))
+
+# Keeping only these variables whose completeness is above a threshold of 3%. Removing the rest
+# checking NAs
+completeness_rate <- apply(har.train, 2, function(x) {mean(!is.na(x))})
+completeness_cols <- which(completeness_rate > 0.03)
+har.train <- har.train[,completeness_cols]
+har.test <- har.test[,completeness_cols]
+
+# Checking empty strings
+completeness_rate <- apply(har.train, 2, function(x) {mean(x != "")})
+completeness_cols <- which(completeness_rate > 0.03)
+har.train <- har.train[,completeness_cols]
+har.test <- har.test[,completeness_cols]
+
+# sanity check
+mean(complete.cases(har.train))
+
+# outputting dimensions
+dim(har.train)
+
+# factoring response variable
+har.train$classe <- factor(har.train$classe)
+# removing problem_id variable
+har.test <- har.test[,-length(har.test)]
+```
+
+
+### Building up the model
+
+#### Feature selection
+
+A reasonable start would be to reduce the feature space. Removing highly correlated varibales will cause any learning algorithm to compute faster without much of information loss. 
+```{r, echo=T, message=F}
+# calculating correlation matrix and finding all variables which exceed a threshold of .7
+correlationMatrix <- cor(har.train[,1:52])
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=.7)
+highlyCorrelated
+
+# reducing feature space
+har.train <- har.train[, -highlyCorrelated]
+har.test <- har.test[, -highlyCorrelated]
+
+## Get rid of predictors that are very sparse
+nzv <- nearZeroVar(har.train[,1:30])
+length(nzv)
+```
+
+When plotting the predictors against the response 'classe', one can hardly notice any linearity exist. Instead the data seems to be clustered around many gravity points (see appendix). Therefore a model based on trees rather than on a linear regression will make more sense.
+  
+As for a CART based model I would suggest to use a forest in favor of a single tree in order to reduce variance and to increase accuracy, robustness and predictive power. In addition I'd prefer Random Forest upon Bagging, because the former is less exposed to tree structure correlation than the latter, due to the randomness in choosing a predictor to split on.
+   
+Let's break **hat.train** into a training and a validation set, so we can empirically try out the model over a part of the labeled data before running it over a test data. I think that a portion of 70% of the observations are sufficient for our model to learn and train. But nevertheless the decision is relatively arbitrary, and the figure is absolutely not carved in stone. I assume that a more conservative modeler may train her model with more observations. 
+
+```{r, echo=T, message=F}
+set.seed(1)
+inTrain <- createDataPartition(har.train$classe, p = .7, list = F)
+training <- har.train[inTrain,]
+validation <- har.train[-inTrain, ]
+```
+
+```{r, echo=T, message=F, cache = T}
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+train_control <- trainControl(method = "cv", number = 5)
+har.rf <- train(classe ~ ., data = training, method = "rf", allowParallel = T, tcControl = train_control)
+stopCluster(cl)
+```
+
+### Interpreting the model 
+As shown below the most precise model is the one that splits over 2 random predictors. The final model consists of 500 trees. The OOB estimate of error indicates 1.3% - more than 98% accuracy. 
+```{r, echo=T, message=F}
+har.rf
+har.rf$finalModel
+```
+
+When we run the model over the validation set we can generally expect the error rate to increase in comparison to the OOB estimator reported by the model. However as we can see in the following chunk, this is not always the case. I assume a reasonable explanation could be in our case a strong similarity between the validation and the training set.
+
+```{r, echo=T, message=F}
+har.validation.predict <- predict(har.rf, newdata = validation)
+tb <- table(har.validation.predict, validation$classe)
+tb
+# error rate validation
+(sum(tb)-sum(diag(tb)))/sum(tb)
+```
+
+### Prediction of the test sample 
+```{r, echo=T, message=F}
+har.test.predict <- predict(har.rf, newdata = har.test)
+har.test.predict
+# writing prediction to files for submission
+pml_write_files(har.test.predict)
+```
+
+## Appendix
+```{r, echo=T, fig.width=12, fig.height=8, message=F}
+transparentTheme(trans = .4)
+har.split <- split(har.train, har.train$classe)
+subset <- rbind(har.split$A, har.split$B, har.split$C)
+featurePlot(x = subset[,3:5], y = subset[,31], plot = "pairs", auto.key = list(columns = 3))
+
+varImpPlot(har.rf$finalModel, main = "Variable importance") 
+
+predict.right <- har.validation.predict == validation$classe
+qplot(magnet_dumbbell_z, magnet_belt_z, data=validation, color=classe) + ggtitle("Clusters")
+qplot(magnet_dumbbell_z, magnet_belt_z, data=validation, color=predict.right) + ggtitle("Prediction accuracy of validation")
+```
